@@ -1,10 +1,60 @@
-const axios     = require('axios');
-const NodeCache = require('node-cache');
-const { logger }     = require('./logger');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const NodeCache               = require('node-cache');
+const { logger }              = require('./logger');
 const { lookupTerm, readGlossary } = require('./glossaryService');
 
-// Cache: TTL 1 giờ, tối đa 5000 keys
+// ── Cache: TTL 1 giờ, tối đa 5000 keys ───────────────────────────────────────
 const translationCache = new NodeCache({ stdTTL: 3600, maxKeys: 5000 });
+
+// ── Khởi tạo Gemini client (lazy — chỉ khởi tạo khi gọi lần đầu) ─────────────
+let genAIInstance = null;
+const getGenAI = () => {
+  if (!genAIInstance) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error('GEMINI_API_KEY chưa được cấu hình trong environment variables');
+    genAIInstance = new GoogleGenerativeAI(apiKey);
+  }
+  return genAIInstance;
+};
+
+// ── Rate limiter: Gemini Free = 15 RPM ───────────────────────────────────────
+// Cơ chế token bucket đơn giản
+const rateLimiter = {
+  maxPerMinute: 14,          // giữ dưới 15 RPM để có buffer
+  queue:        [],
+  running:      0,
+  timestamps:   [],          // lưu thời điểm các request gần nhất
+
+  async acquire() {
+    return new Promise((resolve) => {
+      this.queue.push(resolve);
+      this._process();
+    });
+  },
+
+  _process() {
+    if (this.queue.length === 0) return;
+
+    const now     = Date.now();
+    const oneMin  = 60 * 1000;
+
+    // Xóa timestamp cũ hơn 1 phút
+    this.timestamps = this.timestamps.filter(t => now - t < oneMin);
+
+    if (this.timestamps.length < this.maxPerMinute) {
+      // Còn quota trong phút này → chạy ngay
+      this.timestamps.push(now);
+      const resolve = this.queue.shift();
+      resolve();
+    } else {
+      // Hết quota → chờ đến khi timestamp cũ nhất thoát khỏi cửa sổ 1 phút
+      const oldestTs   = this.timestamps[0];
+      const waitMs     = oneMin - (now - oldestTs) + 100; // +100ms buffer
+      logger.warn(`Rate limit: chờ ${waitMs}ms trước khi gửi request tiếp theo`);
+      setTimeout(() => this._process(), waitMs);
+    }
+  }
+};
 
 const LANG_MAP = {
   vi: 'Vietnamese',
@@ -38,14 +88,14 @@ const translateText = async (text, targetLang = 'vi', sourceLang = 'auto', jobId
 
   const trimmed = text.trim();
 
-  // 1. Tra từ điển trước
+  // 1. Tra từ điển trước (không tốn API call)
   const hit = lookupTerm(trimmed, targetLang);
   if (hit) {
     logger.info(`Glossary hit: "${trimmed.slice(0, 30)}" → "${hit[targetLang]}"`, { jobId });
     return { translated: hit[targetLang], fromCache: false, fromGlossary: true };
   }
 
-  // 2. Tra cache
+  // 2. Tra cache (không tốn API call)
   const cacheKey = `${targetLang}:${trimmed}`;
   const cached   = translationCache.get(cacheKey);
   if (cached !== undefined)
@@ -59,74 +109,83 @@ const translateText = async (text, targetLang = 'vi', sourceLang = 'auto', jobId
   if (/^https?:\/\//.test(trimmed))
     return { translated: trimmed, fromCache: false, fromGlossary: false, skipped: true };
 
-  // 4. Gọi Anthropic API
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY chưa được cấu hình');
+  // 4. Gọi Gemini API (có rate limit)
+  await rateLimiter.acquire();
 
   const targetLangName  = LANG_MAP[targetLang] || targetLang;
   const glossaryContext = buildGlossaryContext(targetLang);
 
-  const systemPrompt =
+  const systemInstruction =
     `You are a professional technical translator for industrial and engineering documents.\n` +
     `Translate the given text to ${targetLangName}.\n` +
     `Rules:\n` +
-    `- Return ONLY the translated text, no explanation\n` +
-    `- Preserve numbers, units, special characters, line breaks\n` +
-    `- Keep technical codes unchanged: PFC, SKU, ID, No., SN, etc.\n` +
+    `- Return ONLY the translated text, no explanation, no preamble\n` +
+    `- Preserve numbers, units, special characters, and line breaks exactly\n` +
+    `- Keep technical codes unchanged: PFC, SKU, ID, No., SN, REF, etc.\n` +
     `- Keep brand names and model numbers unchanged\n` +
-    `- If text is already ${targetLangName}, return as-is\n` +
+    `- If text is already in ${targetLangName}, return it as-is\n` +
     `- Use glossary terminology exactly${glossaryContext}`;
 
   try {
-    const response = await axios.post(
-      'https://api.anthropic.com/v1/messages',
-      {
-        model:      'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        system:     systemPrompt,
-        messages:   [{ role: 'user', content: trimmed }]
-      },
-      {
-        headers: {
-          'Content-Type':      'application/json',
-          'x-api-key':         apiKey,
-          'anthropic-version': '2023-06-01'
-        },
-        timeout: 30000
-      }
-    );
+    const genAI = getGenAI();
+    const model = genAI.getGenerativeModel({
+      model:             'gemini-1.5-flash',
+      systemInstruction: systemInstruction
+    });
 
-    const translated = response.data.content[0].text.trim();
+    const result   = await model.generateContent(trimmed);
+    const response = await result.response;
+    const translated = response.text().trim();
+
     translationCache.set(cacheKey, translated);
     logger.info(`Translated: "${trimmed.slice(0, 40)}" → "${translated.slice(0, 40)}"`, { jobId, targetLang });
     return { translated, fromCache: false, fromGlossary: false };
 
   } catch (err) {
-    const msg = err.response?.data?.error?.message || err.message;
-    logger.error(`Translation API error: ${msg}`, { jobId });
-    throw new Error(msg);
+    // Xử lý lỗi 429 Too Many Requests
+    if (err.status === 429 || err.message?.includes('429') || err.message?.includes('quota')) {
+      logger.warn(`Rate limit hit (429), chờ 60s rồi thử lại...`, { jobId });
+      await new Promise(r => setTimeout(r, 60000));
+      // Thử lại 1 lần
+      try {
+        const genAI = getGenAI();
+        const model = genAI.getGenerativeModel({
+          model:             'gemini-1.5-flash',
+          systemInstruction: systemInstruction
+        });
+        const result     = await model.generateContent(trimmed);
+        const response   = await result.response;
+        const translated = response.text().trim();
+        translationCache.set(cacheKey, translated);
+        return { translated, fromCache: false, fromGlossary: false };
+      } catch (retryErr) {
+        logger.error(`Retry cũng thất bại: ${retryErr.message}`, { jobId });
+        throw new Error(`Gemini rate limit — thử lại sau: ${retryErr.message}`);
+      }
+    }
+
+    logger.error(`Gemini API error: ${err.message}`, { jobId });
+    throw new Error(err.message);
   }
 };
 
-// ── Dịch hàng loạt có rate limit ─────────────────────────────────────────────
+// ── Dịch hàng loạt (tuần tự để không vượt rate limit) ────────────────────────
+// Không dùng Promise.all vì Gemini Free chỉ có 15 RPM
 const batchTranslate = async (texts, targetLang = 'vi', onProgress = null, jobId = null) => {
-  const results    = [];
-  const BATCH_SIZE = 5;
-  const DELAY_MS   = 350;
+  const results = [];
 
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch   = texts.slice(i, i + BATCH_SIZE);
-    const settled = await Promise.allSettled(
-      batch.map(t => translateText(t, targetLang, 'auto', jobId))
-    );
-    settled.forEach((r, idx) => {
-      if (r.status === 'fulfilled') results.push({ index: i + idx, ...r.value });
-      else results.push({ index: i + idx, translated: batch[idx], error: r.reason?.message });
-    });
-    if (onProgress) onProgress(Math.min(i + BATCH_SIZE, texts.length), texts.length);
-    if (i + BATCH_SIZE < texts.length) await new Promise(r => setTimeout(r, DELAY_MS));
+  for (let i = 0; i < texts.length; i++) {
+    try {
+      const result = await translateText(texts[i], targetLang, 'auto', jobId);
+      results.push({ index: i, ...result });
+    } catch (err) {
+      logger.error(`Batch item ${i} failed`, { error: err.message, jobId });
+      results.push({ index: i, translated: texts[i], error: err.message });
+    }
+    if (onProgress) onProgress(i + 1, texts.length);
     if (i % 50 === 0 && global.gc) global.gc();
   }
+
   return results;
 };
 
