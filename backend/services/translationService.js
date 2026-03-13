@@ -1,197 +1,350 @@
+/**
+ * translationService.js — PFCHub (512MB RAM optimized)
+ *
+ * Chiến lược bộ nhớ:
+ *   - KHÔNG dùng in-memory cache lớn
+ *   - File cache = nguồn sự thật duy nhất (persist qua restart)
+ *   - Session cache: tối đa 500 keys, xoá sạch sau mỗi job
+ *   - Glossary index: chỉ lưu Map<string,string> nhỏ gọn
+ *   - Gemini batch: 8 texts / 1 API call
+ */
+
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const NodeCache               = require('node-cache');
-const { logger }              = require('./logger');
-const { lookupTerm, readGlossary } = require('./glossaryService');
+const fs   = require('fs');
+const path = require('path');
+const { logger }     = require('./logger');
+const { readGlossary, hasChinese, hasEnglish } = require('./glossaryService');
 
-// ── Cache: TTL 1 giờ, tối đa 5000 keys ───────────────────────────────────────
-const translationCache = new NodeCache({ stdTTL: 3600, maxKeys: 5000 });
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+const MAX_MEM_KEYS = 500;
+const BATCH_SIZE   = 8;
+const CACHE_DIR    = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+const CACHE_FILE   = path.join(CACHE_DIR, 'tr_cache.json');
 
-// ── Khởi tạo Gemini client (lazy — chỉ khởi tạo khi gọi lần đầu) ─────────────
+// ── SESSION CACHE (LRU, tối đa 500 keys) ─────────────────────────────────────
+let sessionCache = new Map();
+
+const sessionGet = (key) => sessionCache.get(key);
+
+const sessionSet = (key, value) => {
+  if (sessionCache.size >= MAX_MEM_KEYS) {
+    sessionCache.delete(sessionCache.keys().next().value);
+  }
+  sessionCache.set(key, value);
+};
+
+const releaseSessionCache = () => {
+  const size = sessionCache.size;
+  sessionCache.clear();
+  sessionCache = new Map();
+  if (global.gc) global.gc();
+  logger.info(`Session cache released: ${size} entries freed`);
+};
+
+// ── FILE CACHE ────────────────────────────────────────────────────────────────
+const fileCacheGet = (key) => {
+  try {
+    if (!fs.existsSync(CACHE_FILE)) return undefined;
+    const content = fs.readFileSync(CACHE_FILE, 'utf8');
+    if (content.length < 3) return undefined;
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`"${escaped}":"((?:[^"\\\\]|\\\\.)*)"`);
+    const match   = content.match(pattern);
+    return match ? match[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\') : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const fileCacheSetMany = (entries) => {
+  try {
+    if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+    let existing = {};
+    if (fs.existsSync(CACHE_FILE)) {
+      try { existing = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')); } catch {}
+    }
+    Object.assign(existing, entries);
+    // Giới hạn 50,000 entries
+    const keys = Object.keys(existing);
+    if (keys.length > 50000) {
+      keys.slice(0, keys.length - 40000).forEach(k => delete existing[k]);
+      logger.info('File cache trimmed to 40,000 entries');
+    }
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(existing), 'utf8');
+    logger.info(`File cache: ${Object.keys(existing).length} entries`);
+  } catch (e) {
+    logger.error('File cache write failed', { error: e.message });
+  }
+};
+
+// ── GLOSSARY INDEX ────────────────────────────────────────────────────────────
+let glossaryMap     = new Map();
+let glossaryVersion = '';
+
+const normalize = (t) =>
+  t.toLowerCase().replace(/[\s\u00a0]+/g, ' ').replace(/[.,;:!?。，；：！？]/g, '').trim();
+
+const buildGlossaryMap = (targetLang) => {
+  const g      = readGlossary();
+  const verKey = `${g.version}_${targetLang}`;
+  if (verKey === glossaryVersion && glossaryMap.size > 0) return;
+
+  glossaryMap.clear();
+  g.entries.forEach(entry => {
+    if (!entry[targetLang]) return;
+    const val = entry[targetLang];
+    if (entry.en) glossaryMap.set(normalize(entry.en), val);
+    if (entry.zh) glossaryMap.set(normalize(entry.zh), val);
+    if (entry.zh) glossaryMap.set(entry.zh.trim(), val);
+  });
+  glossaryVersion = verKey;
+  logger.info(`Glossary map: ${glossaryMap.size} keys (lang=${targetLang})`);
+};
+
+const glossaryLookup = (text, targetLang) => {
+  buildGlossaryMap(targetLang);
+  const norm = normalize(text);
+
+  if (glossaryMap.has(norm))        return { value: glossaryMap.get(norm), type: 'exact' };
+  if (glossaryMap.has(text.trim())) return { value: glossaryMap.get(text.trim()), type: 'exact' };
+
+  if (text.length <= 100) {
+    for (const [key, val] of glossaryMap) {
+      if (key.length >= 3 && norm.includes(key)) return { value: val, type: 'fuzzy' };
+    }
+  }
+  return null;
+};
+
+// ── SKIP LOGIC ────────────────────────────────────────────────────────────────
+const SKIP_RE = /^[\d\s\.\,\-\+\%\$€£¥\/\(\)\[\]\:\=\#\@\*\\|_~`'"<>{}]+$/;
+
+const shouldTranslate = (text) => {
+  if (!text || text.trim().length <= 1)       return false;
+  if (SKIP_RE.test(text.trim()))              return false;
+  if (/^https?:\/\//.test(text.trim()))       return false;
+  if (!hasChinese(text) && !hasEnglish(text)) return false;
+  return true;
+};
+
+// ── GEMINI CLIENT ─────────────────────────────────────────────────────────────
 let genAIInstance = null;
 const getGenAI = () => {
   if (!genAIInstance) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) throw new Error('GEMINI_API_KEY chưa được cấu hình trong environment variables');
-    genAIInstance = new GoogleGenerativeAI(apiKey);
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) throw new Error('GEMINI_API_KEY chưa được cấu hình');
+    genAIInstance = new GoogleGenerativeAI(key);
   }
   return genAIInstance;
 };
 
-// ── Rate limiter: Gemini Free = 15 RPM ───────────────────────────────────────
-// Cơ chế token bucket đơn giản
-const rateLimiter = {
-  maxPerMinute: 14,          // giữ dưới 15 RPM để có buffer
-  queue:        [],
-  running:      0,
-  timestamps:   [],          // lưu thời điểm các request gần nhất
-
-  async acquire() {
-    return new Promise((resolve) => {
-      this.queue.push(resolve);
-      this._process();
+// Rate limiter 14 RPM
+const rl = {
+  max: 14, win: 60000, ts: [],
+  async wait() {
+    return new Promise(resolve => {
+      const attempt = () => {
+        const now = Date.now();
+        this.ts = this.ts.filter(t => now - t < this.win);
+        if (this.ts.length < this.max) { this.ts.push(now); resolve(); }
+        else {
+          const delay = this.win - (now - this.ts[0]) + 300;
+          logger.warn(`Rate limit: waiting ${(delay/1000).toFixed(1)}s`);
+          setTimeout(attempt, delay);
+        }
+      };
+      attempt();
     });
-  },
-
-  _process() {
-    if (this.queue.length === 0) return;
-
-    const now     = Date.now();
-    const oneMin  = 60 * 1000;
-
-    // Xóa timestamp cũ hơn 1 phút
-    this.timestamps = this.timestamps.filter(t => now - t < oneMin);
-
-    if (this.timestamps.length < this.maxPerMinute) {
-      // Còn quota trong phút này → chạy ngay
-      this.timestamps.push(now);
-      const resolve = this.queue.shift();
-      resolve();
-    } else {
-      // Hết quota → chờ đến khi timestamp cũ nhất thoát khỏi cửa sổ 1 phút
-      const oldestTs   = this.timestamps[0];
-      const waitMs     = oneMin - (now - oldestTs) + 100; // +100ms buffer
-      logger.warn(`Rate limit: chờ ${waitMs}ms trước khi gửi request tiếp theo`);
-      setTimeout(() => this._process(), waitMs);
-    }
   }
 };
 
 const LANG_MAP = {
-  vi: 'Vietnamese',
-  en: 'English',
-  zh: 'Chinese (Simplified)',
-  ja: 'Japanese',
-  ko: 'Korean',
-  fr: 'French',
-  de: 'German'
+  vi: 'Vietnamese', en: 'English', zh: 'Chinese (Simplified)',
+  ja: 'Japanese', ko: 'Korean', fr: 'French', de: 'German'
 };
 
-// ── Ghép glossary vào system prompt ──────────────────────────────────────────
-const buildGlossaryContext = (targetLang) => {
-  const glossary = readGlossary();
-  const relevant = glossary.entries.filter(e => e[targetLang]).slice(0, 80);
-  if (relevant.length === 0) return '';
-  const lines = relevant.map(e => {
-    const parts = [];
-    if (e.en) parts.push(`EN: "${e.en}"`);
-    if (e.zh) parts.push(`ZH: "${e.zh}"`);
-    parts.push(`→ ${LANG_MAP[targetLang] || targetLang}: "${e[targetLang]}"`);
-    return parts.join(' | ');
-  });
-  return `\n\nGLOSSARY — dùng đúng các bản dịch này khi gặp thuật ngữ:\n${lines.join('\n')}`;
+const getGlossaryContext = (targetLang) => {
+  const g = readGlossary();
+  const items = g.entries.filter(e => e[targetLang]).slice(0, 40);
+  if (!items.length) return '';
+  return '\n\nGLOSSARY:\n' + items.map(e => {
+    const p = [];
+    if (e.en) p.push(`EN:"${e.en}"`);
+    if (e.zh) p.push(`ZH:"${e.zh}"`);
+    p.push(`→"${e[targetLang]}"`);
+    return p.join(' ');
+  }).join('\n');
 };
 
-// ── Dịch một đoạn text ────────────────────────────────────────────────────────
-const translateText = async (text, targetLang = 'vi', sourceLang = 'auto', jobId = null) => {
-  if (!text || text.trim() === '')
-    return { translated: text, fromCache: false, fromGlossary: false };
+const callGemini = async (texts, targetLang, glossaryCtx, jobId) => {
+  await rl.wait();
 
-  const trimmed = text.trim();
-
-  // 1. Tra từ điển trước (không tốn API call)
-  const hit = lookupTerm(trimmed, targetLang);
-  if (hit) {
-    logger.info(`Glossary hit: "${trimmed.slice(0, 30)}" → "${hit[targetLang]}"`, { jobId });
-    return { translated: hit[targetLang], fromCache: false, fromGlossary: true };
-  }
-
-  // 2. Tra cache (không tốn API call)
-  const cacheKey = `${targetLang}:${trimmed}`;
-  const cached   = translationCache.get(cacheKey);
-  if (cached !== undefined)
-    return { translated: cached, fromCache: true, fromGlossary: false };
-
-  // 3. Bỏ qua số / ký hiệu / URL / ký tự đơn
-  if (/^[\d\s\.\,\-\+\%\$€£¥\/\(\)\[\]\:\=\#\@\*]+$/.test(trimmed))
-    return { translated: trimmed, fromCache: false, fromGlossary: false, skipped: true };
-  if (trimmed.length <= 1)
-    return { translated: trimmed, fromCache: false, fromGlossary: false, skipped: true };
-  if (/^https?:\/\//.test(trimmed))
-    return { translated: trimmed, fromCache: false, fromGlossary: false, skipped: true };
-
-  // 4. Gọi Gemini API (có rate limit)
-  await rateLimiter.acquire();
-
-  const targetLangName  = LANG_MAP[targetLang] || targetLang;
-  const glossaryContext = buildGlossaryContext(targetLang);
-
-  const systemInstruction =
-    `You are a professional technical translator for industrial and engineering documents.\n` +
-    `Translate the given text to ${targetLangName}.\n` +
-    `Rules:\n` +
-    `- Return ONLY the translated text, no explanation, no preamble\n` +
-    `- Preserve numbers, units, special characters, and line breaks exactly\n` +
-    `- Keep technical codes unchanged: PFC, SKU, ID, No., SN, REF, etc.\n` +
-    `- Keep brand names and model numbers unchanged\n` +
-    `- If text is already in ${targetLangName}, return it as-is\n` +
-    `- Use glossary terminology exactly${glossaryContext}`;
+  const lang   = LANG_MAP[targetLang] || targetLang;
+  const prompt = texts.map((t, i) => `[${i+1}] ${t}`).join('\n---\n');
+  const sys    =
+    `Translate ALL numbered items to ${lang}.\n` +
+    `Output ONLY a JSON array of strings, same count as input.\n` +
+    `Keep codes/units/brands unchanged (PFC,SKU,ID,No.,mm,kg,pcs...).\n` +
+    `If already ${lang}, keep as-is.${glossaryCtx}`;
 
   try {
-    const genAI = getGenAI();
-    const model = genAI.getGenerativeModel({
+    const model = getGenAI().getGenerativeModel({
       model:             'gemini-1.5-flash',
-      systemInstruction: systemInstruction
+      systemInstruction: sys,
+      generationConfig:  { responseMimeType: 'application/json', maxOutputTokens: 2048 }
     });
+    const res  = await model.generateContent(`Translate ${texts.length} items:\n${prompt}`);
+    const raw  = res.response.text().trim();
 
-    const result   = await model.generateContent(trimmed);
-    const response = await result.response;
-    const translated = response.text().trim();
-
-    translationCache.set(cacheKey, translated);
-    logger.info(`Translated: "${trimmed.slice(0, 40)}" → "${translated.slice(0, 40)}"`, { jobId, targetLang });
-    return { translated, fromCache: false, fromGlossary: false };
-
-  } catch (err) {
-    // Xử lý lỗi 429 Too Many Requests
-    if (err.status === 429 || err.message?.includes('429') || err.message?.includes('quota')) {
-      logger.warn(`Rate limit hit (429), chờ 60s rồi thử lại...`, { jobId });
-      await new Promise(r => setTimeout(r, 60000));
-      // Thử lại 1 lần
-      try {
-        const genAI = getGenAI();
-        const model = genAI.getGenerativeModel({
-          model:             'gemini-1.5-flash',
-          systemInstruction: systemInstruction
-        });
-        const result     = await model.generateContent(trimmed);
-        const response   = await result.response;
-        const translated = response.text().trim();
-        translationCache.set(cacheKey, translated);
-        return { translated, fromCache: false, fromGlossary: false };
-      } catch (retryErr) {
-        logger.error(`Retry cũng thất bại: ${retryErr.message}`, { jobId });
-        throw new Error(`Gemini rate limit — thử lại sau: ${retryErr.message}`);
-      }
+    let parsed;
+    try   { parsed = JSON.parse(raw); }
+    catch {
+      const m = raw.match(/\[[\s\S]*\]/);
+      if (m) parsed = JSON.parse(m[0]);
+      else   throw new Error(`Bad JSON: ${raw.slice(0, 80)}`);
     }
 
-    logger.error(`Gemini API error: ${err.message}`, { jobId });
-    throw new Error(err.message);
+    if (!Array.isArray(parsed) || parsed.length !== texts.length) {
+      logger.warn(`Gemini returned ${parsed?.length}, expected ${texts.length}`);
+      return texts.map((t, i) => (parsed?.[i] ? String(parsed[i]).trim() : t));
+    }
+    return parsed.map(t => String(t).trim());
+
+  } catch (err) {
+    const is429 = err.status === 429
+      || String(err.message).includes('429')
+      || String(err.message).includes('quota');
+    if (is429) {
+      logger.warn('429 quota — waiting 65s...', { jobId });
+      await new Promise(r => setTimeout(r, 65000));
+      return callGemini(texts, targetLang, glossaryCtx, jobId);
+    }
+    throw err;
   }
 };
 
-// ── Dịch hàng loạt (tuần tự để không vượt rate limit) ────────────────────────
-// Không dùng Promise.all vì Gemini Free chỉ có 15 RPM
-const batchTranslate = async (texts, targetLang = 'vi', onProgress = null, jobId = null) => {
-  const results = [];
+// ── PUBLIC: translateText (test đơn lẻ) ──────────────────────────────────────
+const translateText = async (text, targetLang = 'vi', _src = 'auto', jobId = null) => {
+  if (!text?.trim()) return { translated: text, skipped: true };
+  const t = text.trim();
+  if (!shouldTranslate(t)) return { translated: t, skipped: true };
 
-  for (let i = 0; i < texts.length; i++) {
-    try {
-      const result = await translateText(texts[i], targetLang, 'auto', jobId);
-      results.push({ index: i, ...result });
-    } catch (err) {
-      logger.error(`Batch item ${i} failed`, { error: err.message, jobId });
-      results.push({ index: i, translated: texts[i], error: err.message });
+  const g = glossaryLookup(t, targetLang);
+  if (g) return { translated: g.value, fromGlossary: true, matchType: g.type };
+
+  const cKey = `${targetLang}:${t}`;
+  const sess = sessionGet(cKey);
+  if (sess !== undefined) return { translated: sess, fromCache: true };
+
+  const file = fileCacheGet(cKey);
+  if (file !== undefined) { sessionSet(cKey, file); return { translated: file, fromCache: true }; }
+
+  const ctx = getGlossaryContext(targetLang);
+  const [result] = await callGemini([t], targetLang, ctx, jobId);
+  sessionSet(cKey, result);
+  fileCacheSetMany({ [cKey]: result });
+  return { translated: result, fromCache: false, fromGlossary: false };
+};
+
+// ── PUBLIC: batchTranslate (dùng trong excelService) ─────────────────────────
+const batchTranslate = async (items, targetLang = 'vi', onProgress = null, jobId = null) => {
+  const results    = new Array(items.length);
+  const needGemini = [];
+  const toCache    = {};
+
+  // Pass 1: Glossary + Session + File cache
+  logger.info(`batchTranslate: ${items.length} items`, { jobId });
+
+  for (let i = 0; i < items.length; i++) {
+    const text = (items[i].text || '').trim();
+
+    if (!shouldTranslate(text)) {
+      results[i] = { index: items[i].index, translated: text, skipped: true };
+      continue;
     }
-    if (onProgress) onProgress(i + 1, texts.length);
-    if (i % 50 === 0 && global.gc) global.gc();
+
+    const g = glossaryLookup(text, targetLang);
+    if (g) { results[i] = { index: items[i].index, translated: g.value, fromGlossary: true, matchType: g.type }; continue; }
+
+    const cKey = `${targetLang}:${text}`;
+    const sess = sessionGet(cKey);
+    if (sess !== undefined) { results[i] = { index: items[i].index, translated: sess, fromCache: true }; continue; }
+
+    const file = fileCacheGet(cKey);
+    if (file !== undefined) { sessionSet(cKey, file); results[i] = { index: items[i].index, translated: file, fromCache: true }; continue; }
+
+    needGemini.push({ i, index: items[i].index, text, cKey });
   }
+
+  const resolved    = items.length - needGemini.length;
+  const geminiCalls = Math.ceil(needGemini.length / BATCH_SIZE);
+  const pct         = Math.round((resolved / Math.max(items.length, 1)) * 100);
+
+  logger.info(
+    `Pass1: ${resolved}/${items.length} (${pct}%) resolved — ` +
+    `${needGemini.length} need Gemini → ${geminiCalls} calls`,
+    { jobId }
+  );
+  if (onProgress) onProgress({ resolved, needGemini: needGemini.length, total: items.length, geminiCalls });
+
+  // Pass 2: Gemini
+  if (needGemini.length > 0) {
+    const ctx          = getGlossaryContext(targetLang);
+    const totalBatches = Math.ceil(needGemini.length / BATCH_SIZE);
+
+    for (let b = 0; b < totalBatches; b++) {
+      const chunk  = needGemini.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
+      const texts  = chunk.map(x => x.text);
+      logger.info(`Gemini ${b+1}/${totalBatches}: ${texts.length} texts`, { jobId });
+
+      try {
+        const translations = await callGemini(texts, targetLang, ctx, jobId);
+        translations.forEach((translated, idx) => {
+          const { i, index, cKey } = chunk[idx];
+          sessionSet(cKey, translated);
+          toCache[cKey] = translated;
+          results[i]    = { index, translated, fromCache: false, fromGlossary: false };
+        });
+      } catch (err) {
+        logger.error(`Batch ${b+1} failed: ${err.message}`, { jobId });
+        chunk.forEach(({ i, index, text }) => {
+          results[i] = { index, translated: text, error: err.message };
+        });
+      }
+
+      const doneNow = resolved + Math.min((b + 1) * BATCH_SIZE, needGemini.length);
+      if (onProgress) onProgress({ resolved: doneNow, needGemini: needGemini.length, total: items.length, geminiCalls });
+      if (b % 5 === 4 && global.gc) global.gc();
+    }
+  }
+
+  // Flush cache 1 lần
+  if (Object.keys(toCache).length > 0) fileCacheSetMany(toCache);
+
+  // QUAN TRỌNG: Giải phóng RAM sau khi xong job
+  releaseSessionCache();
 
   return results;
 };
 
 const getCacheStats = () => {
-  const s = translationCache.getStats();
-  return { hits: s.hits, misses: s.misses, keys: translationCache.keys().length };
+  let fileKeys = 0;
+  try {
+    if (fs.existsSync(CACHE_FILE)) {
+      fileKeys = (fs.readFileSync(CACHE_FILE, 'utf8').match(/:/g) || []).length;
+    }
+  } catch {}
+  return {
+    session:  { keys: sessionCache.size, maxKeys: MAX_MEM_KEYS },
+    file:     { keys: fileKeys },
+    glossary: { keys: glossaryMap.size }
+  };
 };
 
-module.exports = { translateText, batchTranslate, getCacheStats };
+const clearCache = () => {
+  releaseSessionCache();
+  try { if (fs.existsSync(CACHE_FILE)) fs.unlinkSync(CACHE_FILE); } catch {}
+  logger.info('All caches cleared');
+};
+
+module.exports = { translateText, batchTranslate, getCacheStats, clearCache, releaseSessionCache };
