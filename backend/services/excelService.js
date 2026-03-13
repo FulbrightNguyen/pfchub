@@ -1,28 +1,33 @@
+/**
+ * excelService.js — PFCHub (512MB RAM optimized)
+ *
+ * 2-pass approach để tiết kiệm RAM:
+ *   Pass 1: Đọc file → thu thập texts → GIẢI PHÓNG workbook khỏi RAM
+ *   Pass 2: Dịch tất cả texts (batchTranslate tự quản lý RAM)
+ *   Pass 3: Đọc lại file → ghi bản dịch → xuất output → cleanup
+ */
+
 const ExcelJS = require('exceljs');
 const path    = require('path');
 const fs      = require('fs');
-const { logger }      = require('./logger');
-const { translateText } = require('./translationService');
+const { logger }                              = require('./logger');
+const { batchTranslate, releaseSessionCache } = require('./translationService');
 const { extractTermsFromCell, hasChinese, hasEnglish } = require('./glossaryService');
 
 const OUTPUT_DIR = path.join(__dirname, '..', 'outputs');
 
-// ── Job progress store ────────────────────────────────────────────────────────
-const jobProgress = new Map();
+const jobProgress    = new Map();
 const getJobProgress = (jobId) => jobProgress.get(jobId) || null;
 
-// ── Quét file Excel để lấy thuật ngữ ─────────────────────────────────────────
+// ── Quét file lấy thuật ngữ ───────────────────────────────────────────────────
 const scanExcelForGlossary = async (filePath) => {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(filePath);
-
   const terms = [];
   const seen  = new Set();
-
-  workbook.eachSheet((sheet) => {
-    logger.info(`Scanning sheet: "${sheet.name}" (${sheet.rowCount} rows)`);
-    sheet.eachRow({ includeEmpty: false }, (row) => {
-      row.eachCell({ includeEmpty: false }, (cell) => {
+  workbook.eachSheet(sheet => {
+    sheet.eachRow({ includeEmpty: false }, row => {
+      row.eachCell({ includeEmpty: false }, cell => {
         const val = getCellText(cell);
         if (!val) return;
         extractTermsFromCell(val).forEach(term => {
@@ -32,94 +37,107 @@ const scanExcelForGlossary = async (filePath) => {
       });
     });
   });
-
-  logger.info(`Scan complete: ${terms.length} term pairs found`);
+  logger.info(`Scan: ${terms.length} pairs`);
   return terms;
 };
 
-// ── Dịch toàn bộ file Excel ───────────────────────────────────────────────────
+// ── Dịch file (2-pass để tiết kiệm RAM) ──────────────────────────────────────
 const translateExcelFile = async (filePath, targetLang = 'vi', jobId, onProgress) => {
-  jobProgress.set(jobId, { phase: 'reading', percent: 0, translated: 0, total: 0, errors: 0 });
-
+  jobProgress.set(jobId, { phase: 'reading', percent: 0, translated: 0, total: 0, errors: 0, geminiCalls: 0 });
   logger.info(`Reading: ${path.basename(filePath)}`, { jobId });
-  const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.readFile(filePath);
 
-  // Đếm tổng số cells cần dịch
-  let totalCells = 0;
-  workbook.eachSheet(sheet => {
-    sheet.eachRow({ includeEmpty: false }, row => {
-      row.eachCell({ includeEmpty: false }, cell => {
-        if (shouldTranslate(getCellText(cell))) totalCells++;
+  // ── PASS 1: Thu thập texts (workbook bị GC sau block) ────────────────────
+  const cellMap = new Map(); // "sheetIdx!addr" → text
+
+  {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(filePath);
+    wb.worksheets.forEach((sheet, si) => {
+      sheet.eachRow({ includeEmpty: true }, row => {
+        row.eachCell({ includeEmpty: false }, cell => {
+          const text = getCellText(cell);
+          if (shouldTranslate(text)) cellMap.set(`${si}!${cell.address}`, text);
+        });
       });
     });
-  });
+    // wb ra khỏi scope → GC
+  }
+  if (global.gc) global.gc();
 
-  logger.info(`Total cells to translate: ${totalCells}`, { jobId });
-  jobProgress.set(jobId, { phase: 'translating', percent: 0, translated: 0, total: totalCells, errors: 0 });
+  const totalCells = cellMap.size;
+  logger.info(`Cells: ${totalCells}`, { jobId });
+  jobProgress.set(jobId, { phase: 'translating', percent: 0, translated: 0, total: totalCells, errors: 0, geminiCalls: 0 });
+  if (onProgress) onProgress({ percent: 0, translated: 0, total: totalCells, geminiCalls: 0 });
 
-  let translatedCount = 0;
-  let errorCount      = 0;
-
-  // Dịch từng sheet, từng hàng, từng cell: trên xuống → trái qua phải
-  for (let si = 0; si < workbook.worksheets.length; si++) {
-    const sheet = workbook.worksheets[si];
-    logger.info(`Processing sheet ${si + 1}/${workbook.worksheets.length}: "${sheet.name}"`, { jobId });
-
-    const rows = [];
-    sheet.eachRow({ includeEmpty: true }, row => rows.push(row));
-
-    for (const row of rows) {
-      const cells = [];
-      row.eachCell({ includeEmpty: false }, cell => cells.push(cell));
-
-      for (const cell of cells) {
-        const originalText = getCellText(cell);
-        if (!shouldTranslate(originalText)) continue;
-
-        try {
-          const { translated } = await translateText(originalText, targetLang, 'auto', jobId);
-          applyTranslation(cell, originalText, translated);
-          translatedCount++;
-
-          const percent = Math.round((translatedCount / Math.max(totalCells, 1)) * 100);
-          jobProgress.set(jobId, {
-            phase: 'translating', percent,
-            translated: translatedCount, total: totalCells, errors: errorCount
-          });
-          if (onProgress) onProgress({ percent, translated: translatedCount, total: totalCells });
-
-          // Nhường event loop mỗi 10 cells để SSE không bị block
-          if (translatedCount % 10 === 0) await new Promise(r => setTimeout(r, 30));
-
-        } catch (err) {
-          errorCount++;
-          logger.error(`Cell error [${cell.address}]: ${err.message}`, { jobId });
-          jobProgress.set(jobId, { ...jobProgress.get(jobId), errors: errorCount });
-        }
-      }
-    }
-
-    autoFitColumns(sheet);
+  if (totalCells === 0) {
+    const outputName = await copyOutput(filePath, targetLang);
+    cleanupUpload(filePath);
+    jobProgress.set(jobId, { phase: 'done', percent: 100, translated: 0, total: 0, errors: 0, geminiCalls: 0, outputFile: outputName, _ts: Date.now() });
+    return { outputName, translated: 0, errors: 0, geminiCalls: 0 };
   }
 
-  // Ghi file output
+  // ── PASS 2: Dịch ─────────────────────────────────────────────────────────
+  const addrList = [...cellMap.keys()];
+  const items    = addrList.map((addr, i) => ({ index: i, text: cellMap.get(addr) }));
+  let geminiCalls = 0;
+
+  const results = await batchTranslate(
+    items, targetLang,
+    (stats) => {
+      geminiCalls = stats.geminiCalls || 0;
+      const pct   = Math.round((stats.resolved / Math.max(stats.total, 1)) * 100);
+      jobProgress.set(jobId, { phase: 'translating', percent: pct, translated: stats.resolved, total: stats.total, errors: 0, geminiCalls });
+      if (onProgress) onProgress({ percent: pct, translated: stats.resolved, total: stats.total, geminiCalls });
+    },
+    jobId
+  );
+
+  // Build translation map
+  const transMap = new Map();
+  results.forEach((r, i) => {
+    if (r && !r.skipped && !r.error && r.translated) transMap.set(addrList[i], r.translated);
+  });
+
+  // Giải phóng arrays lớn
+  items.length   = 0;
+  results.length = 0;
+  addrList.length = 0;
+  if (global.gc) global.gc();
+
+  // ── PASS 3: Ghi output ───────────────────────────────────────────────────
+  logger.info('Writing output...', { jobId });
+  const wb2 = new ExcelJS.Workbook();
+  await wb2.xlsx.readFile(filePath);
+
+  let translated = 0, errors = 0;
+
+  wb2.worksheets.forEach((sheet, si) => {
+    sheet.eachRow({ includeEmpty: true }, row => {
+      row.eachCell({ includeEmpty: false }, cell => {
+        const key  = `${si}!${cell.address}`;
+        const tran = transMap.get(key);
+        if (!tran) return;
+        try { applyTranslation(cell, tran); translated++; }
+        catch (e) { errors++; logger.error(`Write [${cell.address}]: ${e.message}`); }
+      });
+    });
+    autoFitColumns(sheet);
+  });
+
   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   const baseName   = path.basename(filePath, path.extname(filePath));
   const outputName = `${baseName}_${targetLang}_${Date.now()}.xlsx`;
-  const outputPath = path.join(OUTPUT_DIR, outputName);
+  await wb2.xlsx.writeFile(path.join(OUTPUT_DIR, outputName));
 
-  await workbook.xlsx.writeFile(outputPath);
+  // Dọn dẹp
+  cleanupUpload(filePath);
+  transMap.clear();
+  cellMap.clear();
+  if (global.gc) global.gc();
 
-  jobProgress.set(jobId, {
-    phase: 'done', percent: 100,
-    translated: translatedCount, total: totalCells,
-    errors: errorCount, outputFile: outputName,
-    _ts: Date.now()
-  });
-
-  logger.info(`Done: ${translatedCount} cells, ${errorCount} errors → ${outputName}`, { jobId });
-  return { outputPath, outputName, translated: translatedCount, errors: errorCount };
+  jobProgress.set(jobId, { phase: 'done', percent: 100, translated, total: totalCells, errors, geminiCalls, outputFile: outputName, _ts: Date.now() });
+  logger.info(`Done: ${translated} cells, ${errors} errors, ${geminiCalls} Gemini calls → ${outputName}`, { jobId });
+  return { outputName, translated, errors, geminiCalls };
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -133,25 +151,26 @@ const getCellText = (cell) => {
   return String(cell.value);
 };
 
+const SKIP_RE = /^[\d\s\.\,\-\+\%\$€£¥\/\(\)\[\]\:\=\#\@\*\\|_~`'"<>{}]+$/;
+
 const shouldTranslate = (text) => {
   if (!text || text.trim().length <= 1) return false;
-  if (/^[\d\s\.\,\-\+\%\$€£¥\/\(\)\[\]\:\=\#\@\*]+$/.test(text.trim())) return false;
+  if (SKIP_RE.test(text.trim()))        return false;
   if (/^https?:\/\//.test(text.trim())) return false;
   return hasChinese(text) || hasEnglish(text);
 };
 
-const applyTranslation = (cell, originalText, translatedText) => {
-  if (translatedText === originalText) return;
-  cell.value = translatedText;
+const applyTranslation = (cell, translated) => {
+  cell.value = translated;
   if (!cell.style)           cell.style           = {};
   if (!cell.style.alignment) cell.style.alignment = {};
-  cell.style.alignment.wrapText  = true;
-  cell.style.alignment.vertical  = cell.style.alignment.vertical || 'top';
+  cell.style.alignment.wrapText = true;
+  cell.style.alignment.vertical = cell.style.alignment.vertical || 'top';
 };
 
 const autoFitColumns = (sheet) => {
   sheet.columns.forEach(col => {
-    if (!col || !col.eachCell) return;
+    if (!col?.eachCell) return;
     let maxLen = 10;
     col.eachCell({ includeEmpty: false }, cell => {
       const text = getCellText(cell);
@@ -166,7 +185,18 @@ const autoFitColumns = (sheet) => {
   });
 };
 
-// Dọn dẹp job cũ sau 30 phút
+const copyOutput = async (filePath, targetLang) => {
+  if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  const baseName   = path.basename(filePath, path.extname(filePath));
+  const outputName = `${baseName}_${targetLang}_${Date.now()}.xlsx`;
+  fs.copyFileSync(filePath, path.join(OUTPUT_DIR, outputName));
+  return outputName;
+};
+
+const cleanupUpload = (filePath) => {
+  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+};
+
 setInterval(() => {
   const cutoff = Date.now() - 30 * 60 * 1000;
   jobProgress.forEach((v, k) => {
