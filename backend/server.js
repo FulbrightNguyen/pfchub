@@ -65,6 +65,17 @@ app.use((err, req, res, next) => {
 });
 
 // ── Khởi động ─────────────────────────────────────────────────────────────────
+// Bật garbage collection thủ công (cần flag --expose-gc)
+if (global.gc) {
+  setInterval(() => {
+    const before = process.memoryUsage().heapUsed;
+    global.gc();
+    const after  = process.memoryUsage().heapUsed;
+    const freed  = Math.round((before - after) / 1024 / 1024);
+    if (freed > 0) logger.info(`GC: freed ${freed}MB RAM`);
+  }, 60000); // chạy GC mỗi 60s
+}
+
 app.listen(PORT, '0.0.0.0', () => {
   logger.info(`PFCHub backend running on port ${PORT}`);
   console.log(`✅ PFCHub Backend → http://localhost:${PORT}`);
